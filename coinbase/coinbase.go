@@ -25,15 +25,20 @@ type Config struct {
 }
 
 type client struct {
-	config Config
-	hmac   hash.Hash
+	config     Config
+	hmac       hash.Hash
+	httpClient *http.Client
 }
 
-type sellRequest struct {
+type orderRequest struct {
 	ProductID          string             `json:"product_id"`
 	Side               string             `json:"side"`
 	OrderConfiguration orderConfiguration `json:"order_configuration"`
 	ClientOrderID      string             `json:"client_order_id"`
+}
+
+type orderResponse struct {
+	OrderID string `json:"order_id"`
 }
 
 type orderConfiguration struct {
@@ -50,23 +55,21 @@ type getOrderDetailResponse struct {
 		OrderID       string `json:"order_id"`
 		ClientOrderID string `json:"client_order_id"`
 		Status        string `json:"status"`
+		FilledSize    string `json:"filled_size"`
+		FilledValue   string `json:"filled_value"`
 	} `json:"order"`
 }
 
-func NewClient(config Config) trading.Client {
+func NewClient(config Config, httpClient *http.Client) trading.Client {
 	return &client{
-		config: config,
-		hmac:   hmac.New(sha256.New, []byte(config.APISecret)),
+		config:     config,
+		hmac:       hmac.New(sha256.New, []byte(config.APISecret)),
+		httpClient: httpClient,
 	}
 }
 
-func (c *client) Sell(req trading.SellRequest) error {
-	u, err := url.Parse(c.config.URL + "/v3/brokerage/orders")
-	if err != nil {
-		return err
-	}
-
-	body := sellRequest{
+func (c *client) Sell(req trading.SellRequest) (trading.SellResponse, error) {
+	body := orderRequest{
 		ProductID: fmt.Sprintf("%s-%s", req.Base, req.Quote),
 		Side:      "SELL",
 		OrderConfiguration: orderConfiguration{
@@ -74,11 +77,54 @@ func (c *client) Sell(req trading.SellRequest) error {
 				BaseSize: req.Amount,
 			},
 		},
-		ClientOrderID: req.IdempotencyKey,
+		ClientOrderID: req.ClientOrderID,
 	}
-	bodyStr, err := json.Marshal(body)
+
+	response, err := c.placeOrder(body)
 	if err != nil {
-		return err
+		return trading.SellResponse{}, err
+	}
+
+	return trading.SellResponse{
+		TradeResponse: trading.TradeResponse{
+			OrderID: response.OrderID,
+		},
+	}, nil
+}
+
+func (c *client) Buy(req trading.BuyRequest) (trading.BuyResponse, error) {
+	body := orderRequest{
+		ProductID: fmt.Sprintf("%s-%s", req.Base, req.Quote),
+		Side:      "BUY",
+		OrderConfiguration: orderConfiguration{
+			MarketMarketIOC: marketMarketIOC{
+				BaseSize: req.Amount,
+			},
+		},
+		ClientOrderID: req.ClientOrderID,
+	}
+
+	response, err := c.placeOrder(body)
+	if err != nil {
+		return trading.BuyResponse{}, err
+	}
+
+	return trading.BuyResponse{
+		TradeResponse: trading.TradeResponse{
+			OrderID: response.OrderID,
+		},
+	}, nil
+}
+
+func (c *client) placeOrder(req orderRequest) (orderResponse, error) {
+	u, err := url.Parse(c.config.URL + "/api/v3/brokerage/orders")
+	if err != nil {
+		return orderResponse{}, err
+	}
+
+	bodyStr, err := json.Marshal(req)
+	if err != nil {
+		return orderResponse{}, err
 	}
 
 	timestamp := time.Now().Unix()
@@ -86,38 +132,36 @@ func (c *client) Sell(req trading.SellRequest) error {
 
 	httpReq, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(bodyStr))
 	if err != nil {
-		return err
+		return orderResponse{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("CB-ACCESS-KEY", c.config.APIKey)
-	httpReq.Header.Set("CB-ACCESS-SIGN", signature)
-	httpReq.Header.Set("CB-ACCESS-TIMESTAMP", strconv.FormatInt(timestamp, 10))
+	httpReq.Header = c.createHeader(signature, timestamp)
 
-	res, err := http.DefaultClient.Do(httpReq)
+	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		return orderResponse{}, err
 	}
 
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		return err
+		return orderResponse{}, err
 	}
 
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
+		return orderResponse{}, fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
 	}
 
-	fmt.Printf("get response %s\n", resBody)
-	return nil
-}
+	var response orderResponse
+	err = json.Unmarshal(resBody, &response)
+	if err != nil {
+		return orderResponse{}, err
+	}
 
-func (c *client) Buy(req trading.BuyRequest) error {
-	return nil
+	return response, nil
 }
 
 func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetOrderDetailResponse, error) {
-	u, err := url.Parse(c.config.URL + fmt.Sprintf("/v3/brokerage/orders/historical/%s", req.IdempotencyKey))
+	u, err := url.Parse(c.config.URL + fmt.Sprintf("/api/v3/brokerage/orders/historical/%s", req.IdempotencyKey))
 	if err != nil {
 		return trading.GetOrderDetailResponse{}, err
 	}
@@ -130,12 +174,9 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 		return trading.GetOrderDetailResponse{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("CB-ACCESS-KEY", c.config.APIKey)
-	httpReq.Header.Set("CB-ACCESS-SIGN", signature)
-	httpReq.Header.Set("CB-ACCESS-TIMESTAMP", strconv.FormatInt(timestamp, 10))
+	httpReq.Header = c.createHeader(signature, timestamp)
 
-	res, err := http.DefaultClient.Do(httpReq)
+	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return trading.GetOrderDetailResponse{}, err
 	}
@@ -148,7 +189,6 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 	if res.StatusCode != http.StatusOK {
 		return trading.GetOrderDetailResponse{}, fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
 	}
-	fmt.Printf("get response %s\n", resBody)
 
 	var getOrderDetailResponse getOrderDetailResponse
 	err = json.Unmarshal(resBody, &getOrderDetailResponse)
@@ -157,7 +197,9 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 	}
 
 	return trading.GetOrderDetailResponse{
-		Status: getOrderDetailResponse.Order.Status,
+		Status:        getOrderDetailResponse.Order.Status,
+		ExecutedBase:  getOrderDetailResponse.Order.FilledSize,
+		ExecutedQuote: getOrderDetailResponse.Order.FilledValue,
 	}, nil
 }
 
@@ -166,4 +208,13 @@ func (c *client) sign(body string, timestamp int64, requestMethod, path string) 
 	c.hmac.Write([]byte(strconv.FormatInt(timestamp, 10) + requestMethod + path + body))
 
 	return hex.EncodeToString(c.hmac.Sum(nil))
+}
+
+func (c *client) createHeader(signature string, timestamp int64) http.Header {
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	header.Set("CB-ACCESS-KEY", c.config.APIKey)
+	header.Set("CB-ACCESS-SIGN", signature)
+	header.Set("CB-ACCESS-TIMESTAMP", strconv.FormatInt(timestamp, 10))
+	return header
 }

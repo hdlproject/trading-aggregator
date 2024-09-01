@@ -23,7 +23,7 @@ type Config struct {
 	APISecret string
 }
 
-type sellRequest struct {
+type placeOrderRequest struct {
 	Symbol        string `json:"symbol"`
 	Side          string `json:"side"`
 	Quantity      string `json:"quantity"`
@@ -32,7 +32,12 @@ type sellRequest struct {
 	Timestamp     int64  `json:"timestamp"`
 }
 
-func (r *sellRequest) String() string {
+type placeOrderResponse struct {
+	OrderID       int64  `json:"orderId"`
+	ClientOrderID string `json:"clientOrderId"`
+}
+
+func (r *placeOrderRequest) String() string {
 	u := url.Values{}
 	u["symbol"] = []string{r.Symbol}
 	u["side"] = []string{r.Side}
@@ -47,49 +52,102 @@ func (r *sellRequest) String() string {
 type getOrderDetailRequest struct {
 	Symbol        string `json:"symbol"`
 	ClientOrderID string `json:"origClientOrderId"`
+	OrderID       string `json:"orderId"`
+	Timestamp     int64  `json:"timestamp"`
 }
 
 type getOrderDetailResponse struct {
-	Symbol        string `json:"symbol"`
-	ClientOrderID string `json:"clientOrderId"`
-	Status        string `json:"status"`
+	Symbol              string `json:"symbol"`
+	ClientOrderID       string `json:"clientOrderId"`
+	Status              string `json:"status"`
+	ExecutedQty         string `json:"executedQty"`
+	CummulativeQuoteQty string `json:"cummulativeQuoteQty"`
 }
 
 func (r *getOrderDetailRequest) String() string {
 	u := url.Values{}
 	u["symbol"] = []string{r.Symbol}
-	u["origClientOrderId"] = []string{r.ClientOrderID}
+	if r.ClientOrderID != "" {
+		u["origClientOrderId"] = []string{r.ClientOrderID}
+	}
+	if r.OrderID != "" {
+		u["orderId"] = []string{r.OrderID}
+	}
+	u["timestamp"] = []string{strconv.FormatInt(r.Timestamp, 10)}
 
 	return u.Encode()
 }
 
+type errorResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
 type client struct {
-	config Config
-	hmac   hash.Hash
+	config     Config
+	hmac       hash.Hash
+	httpClient *http.Client
 }
 
-func NewClient(config Config) trading.Client {
+func NewClient(config Config, httpClient *http.Client) trading.Client {
 	return &client{
-		config: config,
-		hmac:   hmac.New(sha256.New, []byte(config.APISecret)),
+		config:     config,
+		hmac:       hmac.New(sha256.New, []byte(config.APISecret)),
+		httpClient: httpClient,
 	}
 }
 
-func (c *client) Sell(req trading.SellRequest) error {
-	u, err := url.Parse(c.config.URL + "/v3/order")
-	if err != nil {
-		return err
-	}
-
-	body := sellRequest{
+func (c *client) Sell(req trading.SellRequest) (trading.SellResponse, error) {
+	body := placeOrderRequest{
 		Symbol:        fmt.Sprintf("%s%s", req.Base, req.Quote),
 		Side:          "SELL",
 		Quantity:      req.Amount,
 		Type:          "MARKET",
-		ClientOrderID: req.IdempotencyKey,
+		ClientOrderID: req.ClientOrderID,
 		Timestamp:     time.Now().UTC().UnixMilli(),
 	}
-	bodyStr := body.String()
+
+	sellResponse, err := c.placeOrder(body)
+	if err != nil {
+		return trading.SellResponse{}, err
+	}
+
+	return trading.SellResponse{
+		TradeResponse: trading.TradeResponse{
+			OrderID: strconv.FormatInt(sellResponse.OrderID, 10),
+		},
+	}, nil
+}
+
+func (c *client) Buy(req trading.BuyRequest) (trading.BuyResponse, error) {
+	body := placeOrderRequest{
+		Symbol:        fmt.Sprintf("%s%s", req.Base, req.Quote),
+		Side:          "BUY",
+		Quantity:      req.Amount,
+		Type:          "MARKET",
+		ClientOrderID: req.ClientOrderID,
+		Timestamp:     time.Now().UTC().UnixMilli(),
+	}
+
+	sellResponse, err := c.placeOrder(body)
+	if err != nil {
+		return trading.BuyResponse{}, err
+	}
+
+	return trading.BuyResponse{
+		TradeResponse: trading.TradeResponse{
+			OrderID: strconv.FormatInt(sellResponse.OrderID, 10),
+		},
+	}, nil
+}
+
+func (c *client) placeOrder(req placeOrderRequest) (placeOrderResponse, error) {
+	u, err := url.Parse(c.config.URL + "/api/v3/order")
+	if err != nil {
+		return placeOrderResponse{}, err
+	}
+
+	bodyStr := req.String()
 
 	signature := c.sign("", bodyStr)
 
@@ -99,43 +157,51 @@ func (c *client) Sell(req trading.SellRequest) error {
 
 	httpReq, err := http.NewRequest(http.MethodPost, u.String(), strings.NewReader(bodyStr))
 	if err != nil {
-		return err
+		return placeOrderResponse{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-MBX-APIKEY", c.config.APIKey)
+	httpReq.Header = c.createHeader()
 
-	res, err := http.DefaultClient.Do(httpReq)
+	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		return placeOrderResponse{}, err
 	}
 
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		return err
+		return placeOrderResponse{}, err
 	}
 
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
+		var errorResponse errorResponse
+		err = json.Unmarshal(resBody, &errorResponse)
+		if err == nil {
+			return placeOrderResponse{}, fmt.Errorf("get http response code %d and error %v", res.StatusCode, errorResponse)
+		}
+
+		return placeOrderResponse{}, fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
 	}
 
-	fmt.Printf("get response %s\n", resBody)
-	return nil
-}
+	var response placeOrderResponse
+	err = json.Unmarshal(resBody, &response)
+	if err != nil {
+		return placeOrderResponse{}, err
+	}
 
-func (c *client) Buy(req trading.BuyRequest) error {
-	return nil
+	return response, nil
 }
 
 func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetOrderDetailResponse, error) {
-	u, err := url.Parse(c.config.URL + "/v3/order")
+	u, err := url.Parse(c.config.URL + "/api/v3/order")
 	if err != nil {
 		return trading.GetOrderDetailResponse{}, err
 	}
 
 	q := getOrderDetailRequest{
 		Symbol:        fmt.Sprintf("%s%s", req.Base, req.Quote),
-		ClientOrderID: req.IdempotencyKey,
+		OrderID:       req.OrderID,
+		ClientOrderID: req.ClientOrderID,
+		Timestamp:     time.Now().UTC().UnixMilli(),
 	}
 	qStr := q.String()
 	u.RawQuery = qStr
@@ -151,10 +217,9 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 		return trading.GetOrderDetailResponse{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-MBX-APIKEY", c.config.APIKey)
+	httpReq.Header = c.createHeader()
 
-	res, err := http.DefaultClient.Do(httpReq)
+	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return trading.GetOrderDetailResponse{}, err
 	}
@@ -167,7 +232,6 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 	if res.StatusCode != http.StatusOK {
 		return trading.GetOrderDetailResponse{}, fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
 	}
-	fmt.Printf("get response %s\n", resBody)
 
 	var getOrderStatusResponse getOrderDetailResponse
 	err = json.Unmarshal(resBody, &getOrderStatusResponse)
@@ -176,7 +240,9 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 	}
 
 	return trading.GetOrderDetailResponse{
-		Status: getOrderStatusResponse.Status,
+		Status:        getOrderStatusResponse.Status,
+		ExecutedBase:  getOrderStatusResponse.ExecutedQty,
+		ExecutedQuote: getOrderStatusResponse.CummulativeQuoteQty,
 	}, nil
 }
 
@@ -185,4 +251,11 @@ func (c *client) sign(query, body string) string {
 	c.hmac.Write([]byte(query + body))
 
 	return hex.EncodeToString(c.hmac.Sum(nil))
+}
+
+func (c *client) createHeader() http.Header {
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	header.Set("X-MBX-APIKEY", c.config.APIKey)
+	return header
 }

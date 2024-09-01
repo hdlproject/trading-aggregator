@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"trading-aggregator/trading"
+
+	"github.com/shopspring/decimal"
 )
 
 type Config struct {
@@ -24,11 +26,12 @@ type Config struct {
 }
 
 type client struct {
-	config Config
-	hmac   hash.Hash
+	config     Config
+	hmac       hash.Hash
+	httpClient *http.Client
 }
 
-type sellRequest struct {
+type orderRequest struct {
 	Category    string `json:"category"`
 	Symbol      string `json:"symbol"`
 	Side        string `json:"side"`
@@ -37,15 +40,32 @@ type sellRequest struct {
 	OrderLinkID string `json:"orderLinkId"`
 }
 
+type orderResponse struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		OrderID     string `json:"orderId"`
+		OrderLinkID string `json:"orderLinkId"`
+	} `json:"result"`
+	RetExtInfo struct{} `json:"retExtInfo"`
+	Time       int64    `json:"time"`
+}
+
 type getOrderDetailRequest struct {
 	Category    string `json:"category"`
+	OrderID     string `json:"orderId"`
 	OrderLinkID string `json:"orderLinkId"`
 }
 
 func (r *getOrderDetailRequest) String() string {
 	u := url.Values{}
 	u["category"] = []string{r.Category}
-	u["orderLinkId"] = []string{r.OrderLinkID}
+	if r.OrderID != "" {
+		u["orderId"] = []string{r.OrderID}
+	}
+	if r.OrderLinkID != "" {
+		u["orderLinkId"] = []string{r.OrderLinkID}
+	}
 
 	return u.Encode()
 }
@@ -73,30 +93,67 @@ type orderData struct {
 	RejectedReason string `json:"rejectReason"`
 }
 
-func NewClient(config Config) trading.Client {
+func NewClient(config Config, httpClient *http.Client) trading.Client {
 	return &client{
-		config: config,
-		hmac:   hmac.New(sha256.New, []byte(config.APISecret)),
+		config:     config,
+		hmac:       hmac.New(sha256.New, []byte(config.APISecret)),
+		httpClient: httpClient,
 	}
 }
 
-func (c *client) Sell(req trading.SellRequest) error {
-	u, err := url.Parse(c.config.URL + "/v5/order/create")
-	if err != nil {
-		return err
-	}
-
-	body := sellRequest{
+func (c *client) Sell(req trading.SellRequest) (trading.SellResponse, error) {
+	body := orderRequest{
 		Category:    "spot",
 		Symbol:      fmt.Sprintf("%s%s", req.Base, req.Quote),
 		Side:        "Sell",
 		Qty:         req.Amount,
 		OrderType:   "Market",
-		OrderLinkID: req.IdempotencyKey,
+		OrderLinkID: req.ClientOrderID,
 	}
-	bodyStr, err := json.Marshal(body)
+
+	response, err := c.placeOrder(body)
 	if err != nil {
-		return err
+		return trading.SellResponse{}, err
+	}
+
+	return trading.SellResponse{
+		TradeResponse: trading.TradeResponse{
+			OrderID: response.Result.OrderID,
+		},
+	}, nil
+}
+
+func (c *client) Buy(req trading.BuyRequest) (trading.BuyResponse, error) {
+	body := orderRequest{
+		Category:    "spot",
+		Symbol:      fmt.Sprintf("%s%s", req.Base, req.Quote),
+		Side:        "Buy",
+		Qty:         req.Amount,
+		OrderType:   "Market",
+		OrderLinkID: req.ClientOrderID,
+	}
+
+	response, err := c.placeOrder(body)
+	if err != nil {
+		return trading.BuyResponse{}, err
+	}
+
+	return trading.BuyResponse{
+		TradeResponse: trading.TradeResponse{
+			OrderID: response.Result.OrderID,
+		},
+	}, nil
+}
+
+func (c *client) placeOrder(req orderRequest) (orderResponse, error) {
+	u, err := url.Parse(c.config.URL + "/v5/order/create")
+	if err != nil {
+		return orderResponse{}, err
+	}
+
+	bodyStr, err := json.Marshal(req)
+	if err != nil {
+		return orderResponse{}, err
 	}
 
 	recvWindow := int64(10000)
@@ -105,36 +162,32 @@ func (c *client) Sell(req trading.SellRequest) error {
 
 	httpReq, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(bodyStr))
 	if err != nil {
-		return err
+		return orderResponse{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-BAPI-API-KEY", c.config.APIKey)
-	httpReq.Header.Set("X-BAPI-TIMESTAMP", strconv.FormatInt(timestamp, 10))
-	httpReq.Header.Set("X-BAPI-SIGN", signature)
-	httpReq.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	httpReq.Header.Set("X-BAPI-RECV-WINDOW", strconv.FormatInt(recvWindow, 10))
+	httpReq.Header = c.createHeader(signature, timestamp, recvWindow)
 
-	res, err := http.DefaultClient.Do(httpReq)
+	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		return orderResponse{}, err
 	}
 
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		return err
+		return orderResponse{}, err
 	}
 
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
+		return orderResponse{}, fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
 	}
 
-	fmt.Printf("get response %s\n", resBody)
-	return nil
-}
+	var response orderResponse
+	err = json.Unmarshal(resBody, &response)
+	if err != nil {
+		return orderResponse{}, err
+	}
 
-func (c *client) Buy(req trading.BuyRequest) error {
-	return nil
+	return response, nil
 }
 
 func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetOrderDetailResponse, error) {
@@ -145,7 +198,8 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 
 	q := getOrderDetailRequest{
 		Category:    "spot",
-		OrderLinkID: req.IdempotencyKey,
+		OrderID:     req.OrderID,
+		OrderLinkID: req.ClientOrderID,
 	}
 	qStr := q.String()
 	u.RawQuery = qStr
@@ -159,14 +213,9 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 		return trading.GetOrderDetailResponse{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-BAPI-API-KEY", c.config.APIKey)
-	httpReq.Header.Set("X-BAPI-TIMESTAMP", strconv.FormatInt(timestamp, 10))
-	httpReq.Header.Set("X-BAPI-SIGN", signature)
-	httpReq.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	httpReq.Header.Set("X-BAPI-RECV-WINDOW", strconv.FormatInt(recvWindow, 10))
+	httpReq.Header = c.createHeader(signature, timestamp, recvWindow)
 
-	res, err := http.DefaultClient.Do(httpReq)
+	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return trading.GetOrderDetailResponse{}, err
 	}
@@ -179,7 +228,6 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 	if res.StatusCode != http.StatusOK {
 		return trading.GetOrderDetailResponse{}, fmt.Errorf("get http response code %d and body %s", res.StatusCode, resBody)
 	}
-	fmt.Printf("get response %s\n", resBody)
 
 	var getOrderDetailResponse getOrderDetailResponse
 	err = json.Unmarshal(resBody, &getOrderDetailResponse)
@@ -187,8 +235,15 @@ func (c *client) GetOrderDetail(req trading.GetOrderDetailRequest) (trading.GetO
 		return trading.GetOrderDetailResponse{}, err
 	}
 
+	executedQuote, err := c.getExecutedQuote(getOrderDetailResponse.Result.List[0])
+	if err != nil {
+		return trading.GetOrderDetailResponse{}, err
+	}
+
 	return trading.GetOrderDetailResponse{
-		Status: getOrderDetailResponse.Result.List[0].OrderStatus,
+		Status:        getOrderDetailResponse.Result.List[0].OrderStatus,
+		ExecutedBase:  getOrderDetailResponse.Result.List[0].CumExecQty,
+		ExecutedQuote: executedQuote.String(),
 	}, nil
 }
 
@@ -197,4 +252,31 @@ func (c *client) sign(query, body string, timestamp, recvWindow int64) string {
 	c.hmac.Write([]byte(strconv.FormatInt(timestamp, 10) + c.config.APIKey + strconv.FormatInt(recvWindow, 10) + query + body))
 
 	return hex.EncodeToString(c.hmac.Sum(nil))
+}
+
+func (c *client) createHeader(signature string, timestamp, recvWindow int64) http.Header {
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	header.Set("X-BAPI-API-KEY", c.config.APIKey)
+	header.Set("X-BAPI-TIMESTAMP", strconv.FormatInt(timestamp, 10))
+	header.Set("X-BAPI-SIGN", signature)
+	header.Set("X-BAPI-SIGN-TYPE", "2")
+	header.Set("X-BAPI-RECV-WINDOW", strconv.FormatInt(recvWindow, 10))
+	return header
+}
+
+func (c *client) getExecutedQuote(order orderData) (decimal.Decimal, error) {
+	if order.AvgPrice != "" {
+		cumExecQtc, err := decimal.NewFromString(order.CumExecQty)
+		if err != nil {
+			return decimal.Decimal{}, err
+		}
+		avgPrice, err := decimal.NewFromString(order.AvgPrice)
+		if err != nil {
+			return decimal.Decimal{}, err
+		}
+		return cumExecQtc.Mul(avgPrice), nil
+	}
+
+	return decimal.NewFromString(order.CumExecValue)
 }
